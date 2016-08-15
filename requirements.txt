@@ -21,3 +21,5 @@ requests-oauthlib
 bleach
 rst2html5-tools
 requests
+ansible-lint
+gitpython

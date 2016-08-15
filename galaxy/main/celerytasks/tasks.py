@@ -20,8 +20,13 @@ import yaml
 import datetime
 import requests
 import logging
+import tempfile
+import shutil
+
+from ansiblelint import Runner as AnsibleLintRunner, RulesCollection, default_rulesdir, formatters
 
 from celery import task
+from git import Repo
 from github import Github
 from github import GithubException
 from urlparse import urlparse
@@ -154,7 +159,7 @@ def add_message(import_task, logger, msg_type, msg_text):
     logger.info("Role %d: %s - %s" % (import_task.role.id, msg_type, msg_text))
 
 
-def get_readme(import_task, logger, repo, branch, token, gh_user):
+def get_readme(import_task, logger, repo, branch, token):
     """
     Retrieve README from the repo and sanitize by removing all markup. Should preserve unicode characters.
     """
@@ -209,10 +214,54 @@ def get_readme(import_task, logger, repo, branch, token, gh_user):
     return readme_raw, readme_html, file_type
 
 
+def lint_role(import_task, logger, role, repo, branch):
+
+    add_message(import_task, logger, "INFO", "Cloning the role for linting...")
+
+    # clone the repo into a tempdir
+    try:
+        tempdir = tempfile.mkdtemp(suffix='_' + role.name, prefix='tmp_')
+    except Exception as exc:
+        fail_import_task(import_task, logger, "Failed to create tempdir: %s" % str(exc))
+
+    try:
+        git_repo = Repo.init(tempdir)
+        origin = git_repo.create_remote('origin', repo.clone_url)
+        origin.fetch()
+        refspec = git_repo.default_branch if not branch else branch
+        origin.pull(refspec=refspec)
+    except Exception as exc:
+        fail_import_task(import_task, logger, "Failed to clone role: %s" % str(exc))
+
+    add_message(import_task, logger, "INFO", "Created temp dir %s" % tempdir)
+
+    # lint
+    formatter = formatters.Formatter()
+    rules = RulesCollection()
+    rules.extend(RulesCollection.create_from_directory(default_rulesdir))
+    skip_list = ['ANSIBLE0002']
+    runner = AnsibleLintRunner(rules, tempdir, [], skip_list, [], 0)
+    matches = list()
+    add_message(import_task, logger, "INFO", "Run lint...")
+    matches.extend(runner.run())
+
+    for match in matches:
+        msg = formatter.format(match, False)
+        msg = msg.replace(tempdir + '/','')
+        add_message(import_task, logger, "INFO", msg)
+
+    formatter = formatters.ParseableFormatter()
+    for match in matches:
+        msg = formatter.format(match, False)
+        logger.debug(msg)
+
+    # cleanup
+    shutil.rmtree(tempdir, ignore_errors=True)
+
 @task(throws=(Exception,), name="galaxy.main.celerytasks.tasks.import_role")
 def import_role(task_id):
     logger = import_role.get_logger()
-    logger.setLevel(logging.ERROR)
+    logger.setLevel(logging.DEBUG)
 
     try:
         logger.info("Starting task: %d" % int(task_id))
@@ -549,7 +598,11 @@ def import_role(task_id):
             if dep_name not in dep_names:
                 role.dependencies.remove(dep)
 
-    role.readme, role.readme_html, role.readme_type = get_readme(import_task, logger, repo, branch, token, gh_user)
+    role.readme, role.readme_html, role.readme_type = get_readme(import_task,
+                                                                 logger,
+                                                                 repo,
+                                                                 branch,
+                                                                 token)
     
     # helper function to save repeating code:
     def add_role_version(tag):
@@ -577,6 +630,11 @@ def import_role(task_id):
     except Exception, e:
         add_message(import_task, logger, "ERROR", e.message)
 
+    try:
+        lint_role(import_task, logger, role, repo, branch)
+    except Exception as exc:
+        fail_import_task(import_task, logger, "Linting Error: %s" % str(exc))
+
     # determine state of import task
     error_count = import_task.messages.filter(message_type="ERROR").count()
     warning_count = import_task.messages.filter(message_type="WARNING").count()
@@ -585,7 +643,7 @@ def import_role(task_id):
     add_message(import_task, logger, import_state, "Status %s : warnings=%d errors=%d" % (import_state,
                                                                                           warning_count,
                                                                                           error_count))
-    
+
     try:
         import_task.state = import_state
         import_task.finished = timezone.now()

@@ -41,10 +41,10 @@
   - npm
   when: galaxy_install_dev_tools
 
-- name: install pip packages required for galaxy
+- name: Install django
   pip: name=django version=1.8.3
 
-- name: install pip packages required for galaxy
+- name: Install pip packages
   pip: name={{item}}
   with_items:
   - pexpect
@@ -66,8 +66,10 @@
   - PyGithub
   - requests
   - requests-oauthlib
-  - bleach
   - rst2html5-tools
+  - requests
+  - ansible-lint
+  - gitpython
 
 # the avatars directory needs to be there, otherwise the library
 # will complain. It isn't used, as all the avatar info is stored
